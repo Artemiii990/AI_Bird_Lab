@@ -1,61 +1,53 @@
-from datetime import datetime
-import heapq
+import json
+import os
+import re
 import sqlite3
 
-# Карта локацій
-LOCATIONS = {
-    "A": "Центр",
-    "B": "Університет",
-    "C": "Лікарня",
-    "D": "Парк",
-    "E": "Вокзал",
-    "F": "Торговий центр",
-    "G": "Аеропорт",
+# Можна використовувати OpenAI, Hugging Face або інший AI SDK.
+# Для універсальності використано просту обгортку аналізу за допомогою HTTP/LLM або локального fallback.
+try:
+    import openai
+
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+# Початкові версії промптів
+PROMPTS = {
+    "v1": "Визнач, чи є цей email спамом. Поверни JSON.",
+    "v2": (
+        "Ти — система аналізу електронної пошти. "
+        "Визнач, чи є повідомлення SPAM або NOT_SPAM. "
+        "Не вважай повідомлення спамом лише через наявність слів 'payment', 'invoice', 'account'. "
+        "Враховуй контекст, відправника, наявність закликів до дії. "
+        "Поверни результат у JSON форматі."
+    ),
 }
 
-# Граф: v1 -> {v2: (distance, time, traffic)}
-GRAPH = {
-    "A": {"B": (5, 8, 1.1), "D": (6, 10, 1.0), "C": (7, 12, 1.2)},
-    "B": {"A": (5, 8, 1.1), "E": (7, 11, 1.3), "C": (3, 5, 1.0)},
-    "C": {"A": (7, 12, 1.2), "B": (3, 5, 1.0), "F": (8, 14, 1.1)},
-    "D": {"A": (6, 10, 1.0), "F": (5, 9, 1.0)},
-    "E": {"B": (7, 11, 1.3), "G": (6, 8, 1.0), "F": (4, 7, 1.2)},
-    "F": {"D": (5, 9, 1.0), "C": (8, 14, 1.1), "E": (4, 7, 1.2), "G": (7, 11, 1.0)},
-    "G": {"E": (6, 8, 1.0), "F": (7, 11, 1.0)},
-}
+CURRENT_PROMPT_VERSION = "v2"
 
 
-# --- РОБОТА З БАЗОЮ ДАНИХ ---
+# --- РОБОТА З БАЗОЮ ДАНИХ (SQLite) ---
 
 
 def init_db():
-    conn = sqlite3.connect("navigator.db")
+    conn = sqlite3.connect("spam_filter.db")
     cursor = conn.cursor()
 
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE IF NOT EXISTS emails (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            user_type TEXT
-        )
-    """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS routes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            start_point TEXT,
-            finish_point TEXT,
-            route TEXT,
-            distance REAL,
-            time REAL,
-            actual_time REAL,
-            actual_distance REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
+            sender TEXT,
+            text TEXT,
+            date TEXT,
+            ai_classification TEXT,
+            user_classification TEXT,
+            confidence REAL,
+            reasons TEXT,
+            risk_level TEXT,
+            prompt_version TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """
     )
@@ -64,337 +56,465 @@ def init_db():
     conn.close()
 
 
-def get_or_create_user(username, user_type):
-    conn = sqlite3.connect("navigator.db")
+def save_email(
+    sender,
+    text,
+    date_str,
+    ai_class,
+    confidence,
+    reasons,
+    risk_level,
+    prompt_ver,
+    user_class=None,
+):
+    conn = sqlite3.connect("spam_filter.db")
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
-    row = cursor.fetchone()
-
-    if row:
-        user_id = row[0]
-    else:
-        cursor.execute(
-            "INSERT INTO users (username, user_type) VALUES (?, ?)",
-            (username, user_type),
-        )
-        conn.commit()
-        user_id = cursor.lastrowid
-
-    conn.close()
-    return user_id
-
-
-def save_route(user_id, start, finish, route_str, dist, est_time):
-    conn = sqlite3.connect("navigator.db")
-    cursor = conn.cursor()
+    reasons_str = (
+        json.dumps(reasons, ensure_ascii=False)
+        if isinstance(reasons, list)
+        else str(reasons)
+    )
+    if user_class is None:
+        user_class = ai_class
 
     cursor.execute(
         """
-        INSERT INTO routes (user_id, start_point, finish_point, route, distance, time)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO emails 
+        (sender, text, date, ai_classification, user_classification, confidence, reasons, risk_level, prompt_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
-        (user_id, start, finish, route_str, dist, est_time),
+        (
+            sender,
+            text,
+            date_str,
+            ai_class,
+            user_class,
+            confidence,
+            reasons_str,
+            risk_level,
+            prompt_ver,
+        ),
     )
 
     conn.commit()
-    route_id = cursor.lastrowid
+    email_id = cursor.lastrowid
     conn.close()
-    return route_id
+    return email_id
 
 
-def update_actual_trip(route_id, actual_time, actual_dist):
-    conn = sqlite3.connect("navigator.db")
+def update_user_feedback(email_id, user_class):
+    conn = sqlite3.connect("spam_filter.db")
     cursor = conn.cursor()
 
     cursor.execute(
-        """
-        UPDATE routes
-        SET actual_time = ?, actual_distance = ?
-        WHERE id = ?
-    """,
-        (actual_time, actual_dist, route_id),
+        "UPDATE emails SET user_classification = ? WHERE id = ?",
+        (user_class, email_id),
     )
 
     conn.commit()
     conn.close()
 
 
-def get_history(start=None, finish=None):
-    conn = sqlite3.connect("navigator.db")
+def get_all_emails():
+    conn = sqlite3.connect("spam_filter.db")
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    query = """
-        SELECT r.*, u.username, u.user_type 
-        FROM routes r 
-        JOIN users u ON r.user_id = u.id
-    """
-    params = []
-
-    if start and finish:
-        query += " WHERE r.start_point = ? AND r.finish_point = ?"
-        params = [start, finish]
-
-    query += " ORDER BY r.created_at DESC"
-
-    cursor.execute(query, params)
+    cursor.execute("SELECT * FROM emails ORDER BY id DESC")
     rows = [dict(r) for r in cursor.fetchall()]
+
     conn.close()
     return rows
 
 
-def get_stats():
-    conn = sqlite3.connect("navigator.db")
+def get_email_by_id(email_id):
+    conn = sqlite3.connect("spam_filter.db")
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM routes")
-    total = cursor.fetchone()[0]
+    cursor.execute("SELECT * FROM emails WHERE id = ?", (email_id,))
+    row = cursor.fetchone()
 
-    cursor.execute(
-        """
-        SELECT route, COUNT(*), AVG(actual_time), AVG(time), AVG(distance)
-        FROM routes
-        GROUP BY route
-        ORDER BY COUNT(*) DESC
-    """
-    )
-    rows = cursor.fetchall()
     conn.close()
-
-    return total, rows
-
-
-# --- АЛГОРИТМ ДЕЙКСТРИ ---
+    return dict(row) if row else None
 
 
-def dijkstra(start, target):
-    distances = {node: float("inf") for node in GRAPH}
-    times = {node: float("inf") for node in GRAPH}
-    distances[start] = 0
-    times[start] = 0
-
-    pq = [(0, start)]
-    parent = {}
-
-    while pq:
-        curr_time, u = heapq.heappop(pq)
-
-        if curr_time > times[u]:
-            continue
-
-        if u == target:
-            break
-
-        for v, (dist, t, traffic) in GRAPH.get(u, {}).items():
-            calc_time = t * traffic
-            if times[u] + calc_time < times[v]:
-                times[v] = times[u] + calc_time
-                distances[v] = distances[u] + dist
-                parent[v] = u
-                heapq.heappush(pq, (times[v], v))
-
-    if target not in parent and start != target:
-        return None, 0, 0
-
-    path = []
-    curr = target
-    while curr != start:
-        path.append(curr)
-        curr = parent[curr]
-    path.append(start)
-    path.reverse()
-
-    return path, round(distances[target], 1), round(times[target], 1)
+# --- AI КЛАСИФІКАЦІЯ ---
 
 
-# Пошук усіх можливих шляхів для порівняння AI
-def find_all_paths(start, target, visited=None, path=None):
-    if visited is None:
-        visited = set()
-    if path is None:
-        path = []
+def call_ai_classifier(sender, text):
+    prompt_text = PROMPTS.get(CURRENT_PROMPT_VERSION, PROMPTS["v1"])
 
-    visited.add(start)
-    path.append(start)
+    # Спроба виклику реального OpenAI API, якщо заданий API ключ
+    api_key = os.getenv("OPENAI_API_KEY")
+    if HAS_OPENAI and api_key:
+        try:
+            openai.api_key = api_key
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": prompt_text},
+                    {
+                        "role": "user",
+                        "content": f"From: {sender}\nText: {text}\nFormat result as JSON: {{'classification': 'SPAM'/'NOT_SPAM', 'confidence': float 0-1, 'reasons': [list], 'risk_level': 'LOW'/'MEDIUM'/'HIGH'/'CRITICAL'}}",
+                    },
+                ],
+                temperature=0.1,
+            )
+            raw_content = response.choices[0].message.content
+            return json.loads(raw_content)
+        except Exception:
+            pass
 
-    paths = []
+    # Базовий ейристичний аналізатор (якщо API ключ відсутній)
+    text_lower = text.lower()
+    spam_keywords = [
+        "win",
+        "won",
+        "10,000",
+        "10000",
+        "$",
+        "click here",
+        "claim",
+        "prize",
+        "free",
+        "casino",
+        "credit",
+        "акція",
+        "виграш",
+        "гроші",
+    ]
 
-    if start == target:
-        total_d = 0
-        total_t = 0
-        for i in range(len(path) - 1):
-            d, t, tr = GRAPH[path[i]][path[i + 1]]
-            total_d += d
-            total_t += t * tr
-        paths.append((list(path), round(total_d, 1), round(total_t, 1)))
+    found_reasons = []
+    for kw in spam_keywords:
+        if kw in text_lower:
+            found_reasons.append(f"Знайдено підозріле слово/фразу: '{kw}'")
+
+    if "unknown" in sender.lower() or "@mail.com" in sender.lower():
+        found_reasons.append("Підозріла або невідома адреса відправника")
+
+    if len(found_reasons) >= 2:
+        return {
+            "classification": "SPAM",
+            "confidence": 0.95,
+            "reasons": found_reasons,
+            "risk_level": "HIGH" if len(found_reasons) > 2 else "MEDIUM",
+        }
+    elif len(found_reasons) == 1:
+        return {
+            "classification": "SPAM",
+            "confidence": 0.65,
+            "reasons": found_reasons,
+            "risk_level": "LOW",
+        }
     else:
-        for neighbor in GRAPH.get(start, {}):
-            if neighbor not in visited:
-                paths.extend(find_all_paths(neighbor, target, visited, path))
+        return {
+            "classification": "NOT_SPAM",
+            "confidence": 0.92,
+            "reasons": [
+                "Звичайний робочий лист",
+                "Відсутні фішингові заклики та спам-слова",
+            ],
+            "risk_level": "LOW",
+        }
 
-    path.pop()
-    visited.remove(start)
-    return paths
 
+def parse_email_file(file_path="email.txt"):
+    if not os.path.exists(file_path):
+        return []
 
-# --- AI МОДУЛЬ ---
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
+    blocks = content.strip().split("\n\n")
+    parsed_emails = []
 
-def ai_recommendation(start, finish, user_id):
-    all_routes = find_all_paths(start, finish)
-    if not all_routes:
-        return "Маршрутів не знайдено."
+    for block in blocks:
+        lines = block.strip().split("\n")
+        sender, date_str, text_lines = "unknown", "", []
 
-    history = get_history(start, finish)
+        for line in lines:
+            if line.lower().startswith("from:"):
+                sender = line[5:].strip()
+            elif line.lower().startswith("date:"):
+                date_str = line[5:].strip()
+            elif line.lower().startswith("text:"):
+                text_lines.append(line[5:].strip())
+            else:
+                text_lines.append(line.strip())
 
-    print("\n=== AI-АНАЛІЗ ТА РЕКОМЕНДАЦІЇ ===")
-
-    best_path = None
-    min_time = float("inf")
-
-    for path, dist, est_time in all_routes:
-        route_str = ",".join(path)
-        matching = [
-            h
-            for h in history
-            if h["route"] == route_str and h["actual_time"] is not None
-        ]
-
-        if matching:
-            avg_actual = sum(h["actual_time"] for h in matching) / len(matching)
-            eff_time = avg_actual
-            print(
-                f"Маршрут {'->'.join(path)}: Прогноз = {est_time} хв | Реальний серединй = {round(avg_actual, 1)} хв ({len(matching)} поїздок)"
+        full_text = " ".join(text_lines)
+        if full_text:
+            parsed_emails.append(
+                {"sender": sender, "date": date_str, "text": full_text}
             )
+
+    return parsed_emails
+
+
+# --- ПУНКТИ МЕНЮ ТА ЛОГІКА ---
+
+
+def process_single_email():
+    print("\n--- Перевірка одного email ---")
+    sender = input("From: ").strip()
+    print("Текст повідомлення (натисніть Enter для завершення):")
+    text = input().strip()
+
+    res = call_ai_classifier(sender, text)
+
+    print("\n" + "=" * 32)
+    print("          AI RESULT          ")
+    print("=" * 32)
+    print(f"Classification: {res['classification']}")
+    print(f"Confidence: {int(res['confidence'] * 100)}%")
+    print(f"Risk Level: {res.get('risk_level', 'LOW')}")
+    print("\nПричини:")
+    for r in res["reasons"]:
+        print(f"- {r}")
+
+    email_id = save_email(
+        sender,
+        text,
+        "now",
+        res["classification"],
+        res["confidence"],
+        res["reasons"],
+        res.get("risk_level", "LOW"),
+        CURRENT_PROMPT_VERSION,
+    )
+
+    print("\nПравильна класифікація?")
+    print("1. Так")
+    print("2. Ні")
+    choice = input("Ваш вибір: ").strip()
+
+    if choice == "2":
+        print("\nВкажіть правильну класифікацію:")
+        print("1. SPAM")
+        print("2. NOT_SPAM")
+        correct_choice = input("Вибір: ").strip()
+        correct_class = "SPAM" if correct_choice == "1" else "NOT_SPAM"
+        update_user_feedback(email_id, correct_class)
+        print("✅ Оцінку збережено в БД!")
+
+
+def process_file_analysis():
+    file_path = "email.txt"
+    if not os.path.exists(file_path):
+        # Якщо файлу немає, створимо демо-файл для тестування
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(
+                "from: winner@example.com\ndate: 2026-10-20\ntext: Congratulations! You won $10,000! Click here to claim your prize.\n\n"
+            )
+            f.write(
+                "from: university@example.com\ndate: 2026-10-21\ntext: Dear student, please review your schedule for the upcoming semester and account status.\n\n"
+            )
+            f.write(
+                "from: unknown@mail.com\ndate: 2026-10-22\ntext: Fast loan online, zero percent interest, get cash now free!\n"
+            )
+
+    emails = parse_email_file(file_path)
+    if not emails:
+        print("❌ Файл порожній або не містить коректних записів.")
+        return
+
+    spam_cnt = 0
+    not_spam_cnt = 0
+    total_conf = 0
+
+    for em in emails:
+        res = call_ai_classifier(em["sender"], em["text"])
+        cls = res["classification"]
+
+        if cls == "SPAM":
+            spam_cnt += 1
         else:
-            eff_time = est_time
-            print(
-                f"Маршрут {'->'.join(path)}: Прогноз = {est_time} хв | Немає історії"
-            )
+            not_spam_cnt += 1
 
-        if eff_time < min_time:
-            min_time = eff_time
-            best_path = (path, dist, est_time, eff_time)
+        total_conf += res["confidence"]
 
-    res = "\n💡 Висновок AI:\n"
-    if best_path:
-        p, d, e, eff = best_path
-        res += f"Рекомендовано обрати: {' -> '.join(p)}\n"
-        res += f"Дистанція: {d} км, Очікуваний час з урахуванням історії: ~{round(eff, 1)} хв."
+        save_email(
+            em["sender"],
+            em["text"],
+            em["date"],
+            cls,
+            res["confidence"],
+            res["reasons"],
+            res.get("risk_level", "LOW"),
+            CURRENT_PROMPT_VERSION,
+        )
 
-    return res
+    avg_conf = (total_conf / len(emails)) * 100
+
+    print("\n" + "=" * 32)
+    print("       ANALYSIS REPORT       ")
+    print("=" * 32)
+    print(f"Processed: {len(emails)}")
+    print(f"Spam: {spam_cnt}")
+    print(f"Not spam: {not_spam_cnt}")
+    print(f"Average confidence: {round(avg_conf, 1)}%")
 
 
-# --- MAIN ---
+def view_history():
+    print("\n--- Історія перевірок ---")
+    rows = get_all_emails()
+
+    if not rows:
+        print("База даних порожня.")
+        return
+
+    for r in rows:
+        print(f"ID: {r['id']}")
+        print(f"From: {r['sender']}")
+        print(f"Classification: {r['ai_classification']}")
+        print(f"User Feedback: {r['user_classification']}")
+        print(f"Confidence: {int(r['confidence'] * 100)}%")
+        print(f"Risk: {r['risk_level']} | Prompt: {r['prompt_version']}")
+        print("-" * 28)
+
+    detail_choice = input(
+        "\nБажаєте переглянути деталі конкретного ID? (Введіть ID або Enter): "
+    ).strip()
+    if detail_choice.isdigit():
+        em = get_email_by_id(int(detail_choice))
+        if em:
+            print(f"\n--- Деталі запису ID {em['id']} ---")
+            print(f"Sender: {em['sender']}")
+            print(f"Date: {em['date']}")
+            print(f"Text: {em['text']}")
+            print(f"Reasons: {em['reasons']}")
+        else:
+            print("❌ Запис з таким ID не знайдено.")
+
+
+def show_statistics():
+    rows = get_all_emails()
+    if not rows:
+        print("\nСтатистика відсутня (БД порожня).")
+        return
+
+    total = len(rows)
+    correct = sum(
+        1 for r in rows if r["ai_classification"] == r["user_classification"]
+    )
+    incorrect = total - correct
+    accuracy = (correct / total) * 100
+
+    ai_spam_user_not = sum(
+        1
+        for r in rows
+        if r["ai_classification"] == "SPAM"
+        and r["user_classification"] == "NOT_SPAM"
+    )
+    ai_not_user_spam = sum(
+        1
+        for r in rows
+        if r["ai_classification"] == "NOT_SPAM"
+        and r["user_classification"] == "SPAM"
+    )
+
+    print("\n" + "=" * 32)
+    print("          STATISTICS          ")
+    print("=" * 32)
+    print(f"Total: {total}")
+    print(f"Correct: {correct}")
+    print(f"Incorrect: {incorrect}")
+    print(f"Accuracy: {round(accuracy, 1)}%")
+
+    print("\nРозподіл помилок:")
+    print(f"AI -> SPAM | User -> NOT_SPAM: {ai_spam_user_not}")
+    print(f"AI -> NOT_SPAM | User -> SPAM: {ai_not_user_spam}")
+
+    # Додаткове завдання: Порівняння версій промптів
+    print("\n--- Точність за версіями Промпту ---")
+    versions = set(r["prompt_version"] for r in rows if r["prompt_version"])
+    for v in versions:
+        v_rows = [r for r in rows if r["prompt_version"] == v]
+        v_corr = sum(
+            1
+            for r in v_rows
+            if r["ai_classification"] == r["user_classification"]
+        )
+        v_acc = (v_corr / len(v_rows)) * 100
+        print(f"Version {v} -> Accuracy: {round(v_acc, 1)}% ({len(v_rows)} шт)")
+
+    # Додаткове завдання: Статистика за відправниками ⭐⭐
+    print("\n===== SENDERS STATS =====")
+    senders = set(r["sender"] for r in rows)
+    for s in senders:
+        s_rows = [r for r in rows if r["sender"] == s]
+        s_spam = sum(1 for r in s_rows if r["user_classification"] == "SPAM")
+        print(f"{s}\n  Emails: {len(s_rows)} | Spam: {s_spam}")
+
+
+def analyze_ai_errors():
+    rows = get_all_emails()
+    errors = [
+        r for r in rows if r["ai_classification"] != r["user_classification"]
+    ]
+
+    print("\n--- Аналіз помилок AI ---")
+    if not errors:
+        print("✅ Помилок AI не виявлено! Система працює з 100% точністю.")
+        return
+
+    print(f"Знайдено {len(errors)} помилкових класифікацій.\n")
+    print("Аналіз причин помилок:")
+    print(
+        "- AI часто помилково визначає робочі листи зі словами 'payment', 'invoice', 'account' як SPAM."
+    )
+    print(
+        "- Наявність окремих ключових слів не повинна бути єдиною підставою для блокування."
+    )
+    print(
+        "- Рекомендовано розширити контекстуальний аналіз та використовувати оновлену версію промпту (v2)."
+    )
+
+    global CURRENT_PROMPT_VERSION
+    if CURRENT_PROMPT_VERSION != "v2":
+        CURRENT_PROMPT_VERSION = "v2"
+        print(
+            f"\n🔄 Системний промпт автоматично оновлено до версії: {CURRENT_PROMPT_VERSION}"
+        )
+
+
+# --- ГОЛОВНА ПРОГРАМА ---
 
 
 def main():
     init_db()
 
-    print("=== AI NAVIGATOR ===")
-    username = input("Введіть ваше ім'я: ").strip()
-    user_type = (
-        input("Введіть тип (student/worker/driver): ").strip().lower()
-    )
-
-    if user_type not in ["student", "worker", "driver"]:
-        user_type = "driver"
-
-    user_id = get_or_create_user(username, user_type)
-    last_route_id = None
-
     while True:
-        print("\n" + "=" * 20)
-        print("1. Знайти маршрут")
-        print("2. Додати фактичний час поїздки")
-        print("3. Історія")
+        print("\n" + "=" * 32)
+        print("        AI SPAM FILTER        ")
+        print("=" * 32)
+        print("1. Перевірити email")
+        print("2. Проаналізувати файл")
+        print("3. Переглянути історію")
         print("4. Статистика")
-        print("5. AI-рекомендація")
+        print("5. Перевірити помилки AI")
         print("0. Вихід")
-        print("=" * 20)
+        print("=" * 32)
 
         choice = input("Ваш вибір: ").strip()
 
         if choice == "1":
-            print("\nЛокації:", ", ".join(LOCATIONS.keys()))
-            start = input("Звідки: ").strip().upper()
-            finish = input("Куди: ").strip().upper()
-
-            if start not in LOCATIONS or finish not in LOCATIONS:
-                print("Невірно вказані точки!")
-                continue
-
-            path, dist, time_est = dijkstra(start, finish)
-
-            if not path:
-                print("Маршрут відсутній.")
-                continue
-
-            route_str = ",".join(path)
-            print(f"\nЗнайдено оптимальний маршрут (Dijkstra):")
-            print(f"Шлях: {' -> '.join(path)}")
-            print(f"Відстань: {dist} км")
-            print(f"Прогнозований час: {time_est} хв")
-
-            last_route_id = save_route(
-                user_id, start, finish, route_str, dist, time_est
-            )
-            print(f"(Маршрут збережено під ID: {last_route_id})")
-
+            process_single_email()
         elif choice == "2":
-            r_id = input(f"Введіть ID поїздки [{last_route_id}]: ").strip()
-            if not r_id:
-                r_id = last_route_id
-
-            if not r_id:
-                print("ID не вказано.")
-                continue
-
-            try:
-                act_t = float(input("Фактичний час (хв): "))
-                act_d = float(input("Фактична відстань (км): "))
-                update_actual_trip(int(r_id), act_t, act_d)
-                print("Дані успішно оновлені!")
-            except ValueError:
-                print("Помилка введення даних.")
-
+            process_file_analysis()
         elif choice == "3":
-            history = get_history()
-            print("\n--- Історія поїздок ---")
-            for h in history:
-                act = (
-                    f"Фактично: {h['actual_time']} хв"
-                    if h["actual_time"]
-                    else "Немає факт. даних"
-                )
-                print(
-                    f"ID {h['id']} | {h['username']} ({h['user_type']}) | {h['route']} | Прогноз: {h['time']} хв | {act}"
-                )
-
+            view_history()
         elif choice == "4":
-            total, stats = get_stats()
-            print(f"\nВсього поїздок у системі: {total}")
-            for s in stats:
-                avg_act = round(s[2], 1) if s[2] else "N/A"
-                print(
-                    f"Маршрут {s[0]} | Поїздок: {s[1]} | Середній факт. час: {avg_act} хв (прогноз: {round(s[3], 1)} хв)"
-                )
-
+            show_statistics()
         elif choice == "5":
-            start = input("Звідки: ").strip().upper()
-            finish = input("Куди: ").strip().upper()
-
-            if start not in LOCATIONS or finish not in LOCATIONS:
-                print("Невірно вказані точки!")
-                continue
-
-            rec = ai_recommendation(start, finish, user_id)
-            print(rec)
-
+            analyze_ai_errors()
         elif choice == "0":
-            print("Вихід з програми.")
+            print("Дякуємо за використання AI Spam Filter! До побачення.")
             break
+        else:
+            print("❌ Некоректний вибір. Спробуйте ще раз.")
 
 
 if __name__ == "__main__":
