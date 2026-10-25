@@ -1,152 +1,162 @@
-import csv
 import os
+from PIL import Image
+from scipy.io.wavfile import write
 from transformers import pipeline
 
-# Доступні моделі для порівняння
-MODEL_1 = "distilbert-base-uncased-finetuned-sst-2-english"
-MODEL_2 = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+# Завантаження моделей Hugging Face
+print("Завантаження моделей, зачекайте...")
 
-# Завантаження за замовчуванням (перша модель)
-classifier = pipeline("sentiment-analysis", model=MODEL_1)
+# Модель 1: Зображення в текст (Image Captioning)
+vision_pipe = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
 
-# Список з 30 відгуків для автоматичного аналізу
-TEST_REVIEWS = [
-    "The application works perfectly. I use it every day.",
-    "The delivery was late, and the package was damaged.",
-    "The product is acceptable, but nothing special.",
-    "Excellent customer support and fast service!",
-    "The software crashes every time I open it.",
-    "Pretty good quality for this price.",
-    "Terrible experience, I want my money back.",
-    "It is okay, does the job.",
-    "Best purchase I have made this year!",
-    "The UI is confusing and hard to navigate.",
-    "Works fine.",
-    "Bad.",
-    "Oh brilliant, it broke after two minutes of use.",
-    "I love waiting three hours for a response from support.",
-    "Great design, but the battery life is awful.",
-    "The fast shipping was great, but the product arrived broken.",
-    "Cheap material, breaks easily.",
-    "Super fast delivery and nice packaging.",
-    "The app eats too much battery.",
-    "Not worth the price at all.",
-    "It works, but sometimes it lags.",
-    "Absolutely amazing feature set!",
-    "Customer service ignored my email.",
-    "Decent product for everyday tasks.",
-    "Never buying from this brand again.",
-    "Easy to set up and works out of the box.",
-    "The camera is good, but the speakers are quiet.",
-    "Waste of money.",
-    "Simple, clean, and useful.",
-    "I have mixed feelings about this purchase.",
-]
+# Модель 2: Текст у мовлення (Text-to-Speech)
+tts_pipe = pipeline("text-to-speech", model="facebook/mms-tts-eng")
 
 
-def analyze_text(text, pipe):
-    if not text.strip():
+def ensure_folders():
+    if not os.path.exists("input"):
+        os.makedirs("input")
+    if not os.path.exists("output"):
+        os.makedirs("output")
+
+
+def analyze_image(image_path):
+    if not os.path.exists(image_path):
+        print("Помилка: Файл не знайдено!")
         return None
+
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png"]:
+        print("Помилка: Непідтримуваний формат файлу. Використовуйте JPG або PNG.")
+        return None
+
     try:
-        res = pipe(text)[0]
-        label = res["label"].upper()
-        score = round(res["score"], 4)
-        return {"text": text, "label": label, "score": score}
+        img = Image.open(image_path)
+        print("Аналіз зображення...")
+        result = vision_pipe(img)
+        if result and len(result) > 0:
+            description = result[0]["generated_text"]
+            return description
+        else:
+            print("Не вдалося згенерувати опис.")
+            return None
     except Exception as e:
-        print(f"Помилка при аналізі: {e}")
+        print(f"Помилка відкриття зображення: {e}")
         return None
 
 
-def save_to_csv(results, filename="results.csv"):
+def generate_audio(text, output_filename="description.wav"):
     try:
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Text", "Label", "Score"])
-            for r in results:
-                writer.writerow([r["text"], r["label"], r["score"]])
-        print(f"\nРезультати збережено у файл {filename}")
+        print("Генерація голосу...")
+        speech_result = tts_pipe(text)
+
+        output_path = os.path.join("output", output_filename)
+        sampling_rate = speech_result["sampling_rate"]
+        audio_data = speech_result["audio"][0]
+
+        write(output_path, sampling_rate, audio_data)
+        return output_path
     except Exception as e:
-        print(f"Помилка запису у файл: {e}")
+        print(f"Помилка при генерації аудіо: {e}")
+        return None
 
 
-def process_batch(pipe):
-    print("\n--- Запуск аналізу списку відгуків ---")
-    results = []
-    stats = {}
-
-    for text in TEST_REVIEWS:
-        res = analyze_text(text, pipe)
-        if res:
-            results.append(res)
-            label = res["label"]
-            stats[label] = stats.get(label, 0) + 1
-
-            print(
-                f"Текст: {res['text']}\nМітка: {res['label']} | Впевненість: {res['score']}\n"
-            )
-
-    print("\n--- СТАТИСТИКА ---")
-    print(f"Загальна кількість: {len(results)}")
-    for label, count in stats.items():
-        print(f"{label}: {count}")
-
-    save_to_csv(results)
+def save_description_to_file(image_name, description):
+    try:
+        with open("descriptions.txt", "a", encoding="utf-8") as f:
+            f.write(f"Файл: {image_name}\nОпис: {description}\n--------------------\n")
+    except Exception as e:
+        print(f"Помилка збереження опису: {e}")
 
 
-def compare_models():
-    print("\n--- Порівняння двох моделей Hugging Face ---")
-    print(f"Завантаження Моделі 1: {MODEL_1}")
-    pipe1 = pipeline("sentiment-analysis", model=MODEL_1)
+def process_single_image():
+    image_path = input("Введіть шлях до фотографії: ").strip()
+    
+    description = analyze_image(image_path)
+    if not description:
+        return
 
-    print(f"Завантаження Моделі 2: {MODEL_2}")
-    pipe2 = pipeline("sentiment-analysis", model=MODEL_2)
+    print("\nОпис зображення:")
+    print(description)
 
-    print("\n" + "-" * 50)
-    for text in TEST_REVIEWS[:10]:
-        r1 = analyze_text(text, pipe1)
-        r2 = analyze_text(text, pipe2)
+    out_name = input("Введіть назву вихідного файлу (за замовчуванням description.wav): ").strip()
+    if not out_name:
+        out_name = "description.wav"
+    if not out_name.endswith(".wav"):
+        out_name += ".wav"
 
-        print(f"Текст: {text}")
-        print(f"  Model 1: {r1['label']} ({r1['score']})")
-        print(f"  Model 2: {r2['label']} ({r2['score']})")
-        print("-" * 50)
+    audio_path = generate_audio(description, out_name)
+    if audio_path:
+        image_name = os.path.basename(image_path)
+        save_description_to_file(image_name, description)
+
+        print("\n--- ЗВІТ ---")
+        print(f"Назва фотографії: {image_name}")
+        print(f"Розпізнаний опис: {description}")
+        print("Модель Vision: Salesforce/blip-image-captioning-base")
+        print("Модель TTS: facebook/mms-tts-eng")
+        print(f"Аудіо збережено у: {audio_path}")
+
+
+def process_multiple_images():
+    folder_path = input("Введіть шлях до папки з фотографіями (наприклад, input): ").strip()
+    if not os.path.exists(folder_path):
+        print("Папку не знайдено.")
+        return
+
+    files = [f for f in os.listdir(folder_path) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    if not files:
+        print("У папці немає фотографій.")
+        return
+
+    for idx, filename in enumerate(files):
+        print(f"\nОбробка [{idx + 1}/{len(files)}]: {filename}")
+        full_path = os.path.join(folder_path, filename)
+        
+        description = analyze_image(full_path)
+        if description:
+            print(f"Опис: {description}")
+            out_audio = f"output_{os.path.splitext(filename)[0]}.wav"
+            generate_audio(description, out_audio)
+            save_description_to_file(filename, description)
+
+
+def repeat_speech():
+    text = input("Введіть текст для озвучення: ").strip()
+    if not text:
+        print("Текст порожній.")
+        return
+    
+    out_name = input("Назва файлу аудіо (за замовчуванням custom.wav): ").strip()
+    if not out_name:
+        out_name = "custom.wav"
+    if not out_name.endswith(".wav"):
+        out_name += ".wav"
+
+    generate_audio(text, out_name)
 
 
 def main():
-    global classifier
-
+    ensure_folders()
+    
     while True:
-        print("\nREVIEW ANALYZER")
-        print("1. Проаналізувати один відгук")
-        print("2. Проаналізувати готовий список (30 відгуків)")
-        print("3. Порівняти дві моделі")
+        print("\n=== AI Vision & Voice Assistant ===")
+        print("1. Проаналізувати одну фотографію")
+        print("2. Проаналізувати декілька фотографій з папки")
+        print("3. Озвучити текст повторно")
         print("0. Вихід")
 
         choice = input("Ваш вибір: ").strip()
 
         if choice == "1":
-            text = input("\nВведіть текст відгуку: ").strip()
-            if not text:
-                print("Помилка: введено порожній текст!")
-                continue
-
-            res = analyze_text(text, classifier)
-            if res:
-                print("\nРезультат:")
-                print(f"Текст: {res['text']}")
-                print(f"Тональність: {res['label']}")
-                print(f"Впевненість: {res['score']}")
-
+            process_single_email = process_single_image()
         elif choice == "2":
-            process_batch(classifier)
-
+            process_multiple_images()
         elif choice == "3":
-            compare_models()
-
+            repeat_speech()
         elif choice == "0":
             print("Вихід з програми.")
             break
-
         else:
             print("Некоректний вибір. Спробуйте ще раз.")
 
