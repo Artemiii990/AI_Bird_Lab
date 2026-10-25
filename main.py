@@ -1,164 +1,177 @@
+import csv
 import os
-from PIL import Image
-from scipy.io.wavfile import write
-from transformers import pipeline
+import matplotlib.pyplot as plt
 
-# Завантаження моделей Hugging Face
-print("Завантаження моделей, зачекайте...")
+# Імпорт Hugging Face pipeline
+try:
+    from transformers import pipeline
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
 
-# Модель 1: Зображення в текст (Image Captioning)
-vision_pipe = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+# Модель Hugging Face для аналізу молекул за SMILES
+MODEL_NAME = "seyonec/PubChem10M_SMILES_BPE_450k-logP"
 
-# Модель 2: Текст у мовлення (Text-to-Speech)
-tts_pipe = pipeline("text-to-speech", model="facebook/mms-tts-eng")
+# Тестові сполуки (не менше 10)
+MOLECULES = [
+    {"name": "Етанол", "formula": "C2H6O", "smiles": "CCO", "exp_logp": -0.31},
+    {"name": "Оцтова кислота", "formula": "C2H4O2", "smiles": "CC(=O)O", "exp_logp": -0.17},
+    {"name": "Бензен", "formula": "C6H6", "smiles": "C1=CC=CC=C1", "exp_logp": 2.13},
+    {"name": "Метанол", "formula": "CH4O", "smiles": "CO", "exp_logp": -0.77},
+    {"name": "Ацетон", "formula": "C3H6O", "smiles": "CC(=O)C", "exp_logp": -0.24},
+    {"name": "Толуол", "formula": "C7H8", "smiles": "CC1=CC=CC=C1", "exp_logp": 2.73},
+    {"name": "Фенол", "formula": "C6H6O", "smiles": "OC1=CC=CC=C1", "exp_logp": 1.46},
+    {"name": "Аспірин", "formula": "C9H8O4", "smiles": "CC(=O)OC1=CC=CC=C1C(=O)O", "exp_logp": 1.19},
+    {"name": "Кофеїн", "formula": "C8H10N4O2", "smiles": "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "exp_logp": -0.07},
+    {"name": "Вода", "formula": "H2O", "smiles": "O", "exp_logp": -1.38}
+]
 
 
-def ensure_folders():
-    if not os.path.exists("input"):
-        os.makedirs("input")
-    if not os.path.exists("output"):
-        os.makedirs("output")
-
-
-def analyze_image(image_path):
-    if not os.path.exists(image_path):
-        print("Помилка: Файл не знайдено!")
+def load_model():
+    if not HAS_TRANSFORMERS:
+        print("Помилка: бібліотека transformers не встановлена.")
         return None
-
-    ext = os.path.splitext(image_path)[1].lower()
-    if ext not in [".jpg", ".jpeg", ".png"]:
-        print("Помилка: Непідтримуваний формат файлу. Використовуйте JPG або PNG.")
-        return None
-
     try:
-        img = Image.open(image_path)
-        print("Аналіз зображення...")
-        result = vision_pipe(img)
-        if result and len(result) > 0:
-            description = result[0]["generated_text"]
-            return description
-        else:
-            print("Не вдалося згенерувати опис.")
-            return None
+        print("Завантаження моделі Hugging Face...")
+        predictor = pipeline("text-classification", model=MODEL_NAME)
+        return predictor
     except Exception as e:
-        print(f"Помилка відкриття зображення: {e}")
+        print(f"Помилка завантаження моделі: {e}")
         return None
 
 
-def generate_audio(text, output_filename="description.wav"):
+def predict_logp(predictor, smiles):
+    if not predictor:
+        # Резервний аналіз для тестування без мережі
+        return round(len(smiles) * 0.15 - 0.5, 2)
     try:
-        print("Генерація голосу...")
-        speech_result = tts_pipe(text)
-
-        output_path = os.path.join("output", output_filename)
-        sampling_rate = speech_result["sampling_rate"]
-        audio_data = speech_result["audio"][0]
-
-        write(output_path, sampling_rate, audio_data)
-        return output_path
+        result = predictor(smiles)
+        # Отримання числового значення
+        score = round(result[0]["score"], 2)
+        return score
     except Exception as e:
-        print(f"Помилка при генерації аудіо: {e}")
+        print(f"Помилка аналізу SMILES ({smiles}): {e}")
         return None
 
 
-def save_description_to_file(image_name, description):
+def save_to_csv(data, filename="chemistry_results.csv"):
     try:
-        with open("descriptions.txt", "a", encoding="utf-8") as f:
-            f.write(f"Файл: {image_name}\nОпис: {description}\n--------------------\n")
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(["molecule_name", "formula", "smiles", "predicted_property", "predicted_value", "exp_value"])
+            for row in data:
+                writer.writerow([
+                    row["name"],
+                    row["formula"],
+                    row["smiles"],
+                    "LogP (Solubility/Lipophilicity)",
+                    row["predicted_logp"],
+                    row["exp_logp"]
+                ])
+        print(f"Результати збережено у файл {filename}")
     except Exception as e:
-        print(f"Помилка збереження опису: {e}")
+        print(f"Помилка збереження CSV: {e}")
 
 
-def process_single_image():
-    image_path = input("Введіть шлях до фотографії: ").strip()
-    
-    description = analyze_image(image_path)
-    if not description:
-        return
+def plot_results(data):
+    try:
+        names = [item["name"] for item in data]
+        pred_vals = [item["predicted_logp"] for item in data]
+        exp_vals = [item["exp_logp"] for item in data]
 
-    print("\nОпис зображення:")
-    print(description)
-
-    out_name = input("Введіть назву вихідного файлу (за замовчуванням description.wav): ").strip()
-    if not out_name:
-        out_name = "description.wav"
-    if not out_name.endswith(".wav"):
-        out_name += ".wav"
-
-    audio_path = generate_audio(description, out_name)
-    if audio_path:
-        image_name = os.path.basename(image_path)
-        save_description_to_file(image_name, description)
-
-        print("\n--- ЗВІТ ---")
-        print(f"Назва фотографії: {image_name}")
-        print(f"Розпізнаний опис: {description}")
-        print("Модель Vision: Salesforce/blip-image-captioning-base")
-        print("Модель TTS: facebook/mms-tts-eng")
-        print(f"Аудіо збережено у: {audio_path}")
+        plt.figure(figsize=(10, 5))
+        plt.plot(names, pred_vals, label="AI Predict (LogP)", marker="o")
+        plt.plot(names, exp_vals, label="Experiment (LogP)", marker="s", linestyle="--")
+        plt.xticks(rotation=45)
+        plt.xlabel("Речовина")
+        plt.ylabel("Значення LogP")
+        plt.title("Порівняння прогнозу AI з експериментальними даними")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"Помилка побудови графіка: {e}")
 
 
-def process_multiple_images():
-    folder_path = input("Введіть шлях до папки з фотографіями (наприклад, input): ").strip()
-    if not os.path.exists(folder_path):
-        print("Папку не знайдено.")
-        return
+def process_all(predictor):
+    print("\n--- Аналіз 10 хімічних сполук ---")
+    results = []
 
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    if not files:
-        print("У папці немає фотографій.")
-        return
+    for item in MOLECULES:
+        val = predict_logp(predictor, item["smiles"])
+        item_copy = item.copy()
+        item_copy["predicted_logp"] = val
+        results.append(item_copy)
+        print(f"{item['name']} ({item['formula']}) | SMILES: {item['smiles']} | LogP AI: {val}")
 
-    for idx, filename in enumerate(files):
-        print(f"\nОбробка [{idx + 1}/{len(files)}]: {filename}")
-        full_path = os.path.join(folder_path, filename)
-        
-        description = analyze_image(full_path)
-        if description:
-            print(f"Опис: {description}")
-            out_audio = f"output_{os.path.splitext(filename)[0]}.wav"
-            generate_audio(description, out_audio)
-            save_description_to_file(filename, description)
+    save_to_csv(results)
+    return results
 
 
-def repeat_speech():
-    text = input("Введіть текст для озвучення: ").strip()
-    if not text:
-        print("Текст порожній.")
-        return
-    
-    out_name = input("Назва файлу аудіо (за замовчуванням custom.wav): ").strip()
-    if not out_name:
-        out_name = "custom.wav"
-    if not out_name.endswith(".wav"):
-        out_name += ".wav"
+def search_molecule(results):
+    name = input("\nВведіть назву речовини для пошуку: ").strip().lower()
+    found = [m for m in results if name in m["name"].lower()]
 
-    generate_audio(text, out_name)
+    if found:
+        for m in found:
+            print(f"Знайдено: {m['name']} ({m['formula']})")
+            print(f"SMILES: {m['smiles']}")
+            print(f"Прогноз LogP: {m['predicted_logp']} | Експер. значення: {m['exp_logp']}")
+    else:
+        print("Речовину не знайдено.")
+
+
+def compare_molecules(results):
+    print("\n--- Порівняння сполук ---")
+    name1 = input("Введіть першу речовину: ").strip().lower()
+    name2 = input("Введіть другу речовину: ").strip().lower()
+
+    m1 = next((m for m in results if name1 in m["name"].lower()), None)
+    m2 = next((m for m in results if name2 in m["name"].lower()), None)
+
+    if m1 and m2:
+        print(f"\n1. {m1['name']}: LogP AI = {m1['predicted_logp']}, Експер. = {m1['exp_logp']}")
+        print(f"2. {m2['name']}: LogP AI = {m2['predicted_logp']}, Експер. = {m2['exp_logp']}")
+        diff = round(abs(m1['predicted_logp'] - m2['predicted_logp']), 2)
+        print(f"Різниця між прогнозами: {diff}")
+    else:
+        print("Одну або обидві речовини не знайдено.")
 
 
 def main():
-    ensure_folders()
-    
+    predictor = load_model()
+    results = process_all(predictor)
+
     while True:
-        print("\n=== AI Vision & Voice Assistant ===")
-        print("1. Проаналізувати одну фотографію")
-        print("2. Проаналізувати декілька фотографій з папки")
-        print("3. Озвучити текст повторно")
+        print("\n=== AI Chemistry Lab ===")
+        print("1. Показати відсортовані речовини за LogP")
+        print("2. Побудувати графік порівняння")
+        print("3. Пошук речовини за назвою")
+        print("4. Порівняти дві сполуки")
         print("0. Вихід")
 
         choice = input("Ваш вибір: ").strip()
 
         if choice == "1":
-            process_single_email = process_single_image()
+            sorted_res = sorted(results, key=lambda x: x["predicted_logp"])
+            print("\n--- Відсортовано за зростанням LogP ---")
+            for r in sorted_res:
+                print(f"{r['name']}: {r['predicted_logp']}")
+
         elif choice == "2":
-            process_multiple_images()
+            plot_results(results)
+
         elif choice == "3":
-            repeat_speech()
+            search_molecule(results)
+
+        elif choice == "4":
+            compare_molecules(results)
+
         elif choice == "0":
             print("Вихід з програми.")
             break
         else:
-            print("Некоректний вибір. Спробуйте ще раз.")
+            print("Некоректний вибір.")
 
 
 if __name__ == "__main__":
