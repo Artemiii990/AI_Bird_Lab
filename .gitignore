@@ -1,0 +1,7 @@
+node_modules/
+bin/
+obj/
+__pycache__/
+.vs/
+*.db
+.env

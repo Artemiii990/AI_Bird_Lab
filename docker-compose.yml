@@ -1,0 +1,51 @@
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "StrongPassword123!"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'StrongPassword123!' -C -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ai-server:
+    build: ./ai-server
+    ports:
+      - "8000:8000"
+
+  central-api:
+    build: ./central-api
+    ports:
+      - "5000:8080"
+    environment:
+      AiUrl: "http://ai-server:8000"
+      ConnectionStrings__Default: "Server=mssql;Database=BirdDb;User Id=sa;Password=StrongPassword123!;TrustServerCertificate=True;"
+    depends_on:
+      mssql:
+        condition: service_healthy
+      ai-server:
+        condition: service_started
+
+  # mobile-app:
+  #   build: ./mobile-app
+  #   ports:
+  #     - "8081:8081"
+  #   environment:
+  #     REACT_NATIVE_PACKAGER_HOSTNAME: "192.168.0.105" # ЗАМЕНИ НА СВОЙ IP ИЗ ipconfig
+  #   depends_on:
+  #     - central-api
+
+  web-app:
+    build: ./web-app
+    ports:
+      - "3000:5173"
+    depends_on:
+      - central-api
