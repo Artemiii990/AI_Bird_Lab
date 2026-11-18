@@ -1,7 +1,26 @@
-node_modules/
+# Visual Studio / VS Code / C#
+.vs/
 bin/
 obj/
+*.user
+
+# Python
 __pycache__/
-.vs/
-*.db
-.env
+*.py[cod]
+.venv/
+venv/
+
+# Node.js / React
+node_modules/
+dist/
+build/
+
+# Foundry / Solidity
+out/
+cache/
+broadcast/
+
+# OS & Logs
+.DS_Store
+Thumbs.db
+*.log
